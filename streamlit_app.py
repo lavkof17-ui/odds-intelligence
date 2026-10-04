@@ -1,0 +1,122 @@
+import streamlit as st
+import requests
+from datetime import datetime, timedelta, timezone
+
+st.set_page_config(page_title="Odds Intelligence", page_icon="🎯", layout="centered")
+st.title("🎯 Odds Intelligence")
+st.caption("Scanner football • 1xBet • filtre de cotes")
+
+try:
+    API_KEY = st.secrets["ODDS_API_KEY"]
+except Exception:
+    API_KEY = ""
+
+BASE_URL = "https://api.oddspapi.io/v4"
+BOOKMAKER = "1xbet"
+
+def api_get(path, params):
+    if not API_KEY:
+        raise RuntimeError("Clé OddsPapi absente. Ajoute ODDS_API_KEY dans Streamlit → Secrets.")
+    p = dict(params); p["apiKey"] = API_KEY
+    r = requests.get(f"{BASE_URL}/{path}", params=p, timeout=60)
+    if r.status_code == 429:
+        raise RuntimeError("Quota OddsPapi atteint (HTTP 429).")
+    if not r.ok:
+        raise RuntimeError(f"OddsPapi HTTP {r.status_code}: {r.text[:300]}")
+    return r.json()
+
+def name(d, *keys):
+    if not isinstance(d, dict): return ""
+    for k in keys:
+        if d.get(k) not in (None, ""): return str(d[k])
+    return ""
+
+def parse_markets(board):
+    rows=[]
+    markets=(board or {}).get("markets") or {}
+    items=list(enumerate(markets)) if isinstance(markets,list) else list(markets.items())
+    for mid,m in items:
+        if not isinstance(m,dict): continue
+        mname=name(m,"marketName","name","market") or f"Marché {mid}"
+        outcomes=m.get("outcomes") or {}
+        oitems=list(enumerate(outcomes)) if isinstance(outcomes,list) else list(outcomes.items())
+        for oid,o in oitems:
+            if not isinstance(o,dict): continue
+            players=o.get("players")
+            legs=list(players.values()) if isinstance(players,dict) else (players if isinstance(players,list) else [])
+            if not legs: legs=[o]
+            for leg in legs:
+                if not isinstance(leg,dict) or leg.get("active",o.get("active",True)) is False: continue
+                try: price=float(leg.get("price",o.get("price")))
+                except (TypeError,ValueError): continue
+                label=name(leg,"name","label","outcomeName") or name(o,"name","label","outcomeName") or str(oid)
+                rows.append({"market":mname,"outcome":label,"line":leg.get("line",o.get("line")),"odds":price})
+    return rows
+
+def demo():
+    return [
+        {"home":"Barcelona","away":"Real Madrid","league":"Demo","market":"Full Time Result","outcome":"1","line":None,"odds":1.72},
+        {"home":"PSG","away":"Marseille","league":"Demo","market":"Over Under Full Time","outcome":"Over 2.5","line":"2.5","odds":1.80},
+        {"home":"Bayern","away":"Dortmund","league":"Demo","market":"Both Teams To Score","outcome":"Yes","line":None,"odds":1.66},
+    ]
+
+with st.container(border=True):
+    a,b=st.columns(2)
+    min_odds=a.number_input("Cote min",1.01,100.0,1.50,0.01)
+    max_odds=b.number_input("Cote max",1.01,100.0,2.00,0.01)
+    c,d=st.columns(2)
+    min_prob=c.number_input("Probabilité implicite min (%)",0.0,99.9,50.0,1.0)
+    hours=d.selectbox("Fenêtre", [6,12,24,36,48], index=2, format_func=lambda x:f"{x} h")
+    market=st.selectbox("Marché",["Tous les marchés","Full Time Result","Over Under Full Time","Both Teams To Score","Asian Handicap"])
+    x,y=st.columns(2)
+    do_scan=x.button("🔎 SCANNER 1xBET",use_container_width=True,type="primary")
+    do_demo=y.button("🧪 DÉMO",use_container_width=True)
+
+if do_demo:
+    rows=[r for r in demo() if min_odds<=r["odds"]<=max_odds and 1/r["odds"]>=min_prob/100]
+    if market!="Tous les marchés": rows=[r for r in rows if market.lower() in r["market"].lower()]
+    st.session_state.rows=rows; st.session_state.note="Mode démo"
+
+if do_scan:
+    if max_odds<min_odds: st.error("Cote max < cote min.")
+    else:
+        with st.spinner("Scan réel 1xBet en cours…"):
+            try:
+                now=datetime.now(timezone.utc); end=now+timedelta(hours=hours)
+                fixtures=api_get("fixtures",{"sportId":10,"from":now.strftime("%Y-%m-%dT%H:%M:%SZ"),"to":end.strftime("%Y-%m-%dT%H:%M:%SZ"),"statusId":0,"hasOdds":"true","bookmakers":BOOKMAKER})
+                if not isinstance(fixtures,list): fixtures=[]
+                rows=[]; checked=0
+                for f in fixtures:
+                    fid=f.get("fixtureId")
+                    if not fid: continue
+                    try: od=api_get("odds",{"fixtureId":fid,"bookmakers":BOOKMAKER})
+                    except Exception: continue
+                    boards=od.get("bookmakerOdds") or {}; board=boards.get(BOOKMAKER) or (next(iter(boards.values())) if boards else None)
+                    for q in parse_markets(board):
+                        if not (min_odds<=q["odds"]<=max_odds): continue
+                        if market!="Tous les marchés" and market.lower() not in q["market"].lower(): continue
+                        implied=100/q["odds"]
+                        if implied<min_prob: continue
+                        rows.append({"home":name(f,"participant1Name","homeTeamName"),"away":name(f,"participant2Name","awayTeamName"),"league":name(f,"tournamentName","leagueName"),"start":f.get("startTime"),**q,"implied":implied})
+                    checked+=1
+                st.session_state.rows=rows; st.session_state.note=f"{checked} match(s) vérifié(s) • {len(rows)} résultat(s)"
+            except Exception as e:
+                st.error(str(e)); st.session_state.rows=[]
+
+rows=st.session_state.get("rows",[])
+if st.session_state.get("note"): st.info(st.session_state.note)
+if not rows and st.session_state.get("note"): st.warning("Aucun événement ne correspond aux critères.")
+for r in rows:
+    when=""
+    if r.get("start"):
+        try: when=datetime.fromisoformat(r["start"].replace("Z","+00:00")).strftime("%d/%m %H:%M UTC")
+        except Exception: when=str(r["start"])
+    line=f" • Ligne {r['line']}" if r.get("line") is not None else ""
+    with st.container(border=True):
+        st.subheader(f"{r.get('home','')} — {r.get('away','')}")
+        st.caption(f"{r.get('league','')} {('• '+when) if when else ''}")
+        st.write(f"**{r.get('market','')}** — {r.get('outcome','')}{line}")
+        st.metric("Cote",f"{float(r['odds']):.2f}",f"Probabilité implicite {float(r.get('implied',100/r['odds'])):.1f}%")
+
+st.divider()
+st.caption("La probabilité affichée est 1/cote (implicite), pas une garantie. Le moteur de probabilité indépendant sera ajouté ensuite.")
