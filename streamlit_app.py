@@ -365,24 +365,58 @@ def build_fixtures(hours):
 
 
 def account_status():
+    """Read quota from the active subscription returned by /v4/account.
+    OddsPapi nests request_limit/request_count/valid_until inside subscriptions[].
+    """
     data = get_api("account")
     root = data if isinstance(data, dict) else {}
+
+    # Current API shape: {subscriptions: [{...request_limit...}]}
+    subscriptions = root.get("subscriptions")
+    if isinstance(subscriptions, list):
+        active = [s for s in subscriptions if isinstance(s, dict) and s.get("is_active")]
+        candidates = active or [s for s in subscriptions if isinstance(s, dict)]
+        if candidates:
+            sub = candidates[0]
+            limit = sub.get("request_limit")
+            count = sub.get("request_count")
+            valid_from = sub.get("valid_from")
+            valid_until = sub.get("valid_until")
+            auto_renew = sub.get("auto_renew")
+            remaining = None
+            try:
+                if limit is not None and count is not None:
+                    remaining = max(0, int(limit) - int(count))
+            except Exception:
+                pass
+            return limit, count, remaining, valid_from, valid_until, auto_renew
+
+    # Fallback for alternative/older response shapes.
     candidates = [root]
     for key in ("account", "data", "user"):
         if isinstance(root.get(key), dict):
             candidates.append(root[key])
-    limit = count = valid_until = None
+    limit = count = valid_from = valid_until = auto_renew = None
     for d in candidates:
         if limit is None: limit = d.get("request_limit")
         if count is None: count = d.get("request_count")
+        if valid_from is None: valid_from = d.get("valid_from")
         if valid_until is None: valid_until = d.get("valid_until")
+        if auto_renew is None: auto_renew = d.get("auto_renew")
     remaining = None
     try:
         if limit is not None and count is not None:
             remaining = max(0, int(limit) - int(count))
     except Exception:
         pass
-    return limit, count, remaining, valid_until
+    return limit, count, remaining, valid_from, valid_until, auto_renew
+
+
+def quota_datetime(value):
+    dt = parse_dt(value)
+    if not dt:
+        return value or "non indiquée"
+    return dt.astimezone(timezone.utc).strftime("%d/%m/%Y %H:%M UTC")
 
 
 # ---------------- UI ----------------
@@ -418,11 +452,22 @@ with st.container(border=True):
 
 if quota_btn:
     try:
-        limit, count, remaining, valid = account_status()
-        if limit is None:
-            st.info("Quota : OddsPapi n'a pas renvoyé les champs de quota sur ce compte.")
+        limit, count, remaining, valid_from, valid_until, auto_renew = account_status()
+        if limit is None or count is None:
+            st.warning("OddsPapi a répondu, mais aucun quota actif n'a pu être identifié dans /v4/account.")
         else:
-            st.info(f"Quota : {count}/{limit} utilisé(s) • reste {remaining} • validité : {valid or 'non indiquée'}")
+            st.subheader("📊 Quota OddsPapi")
+            q1, q2, q3 = st.columns(3)
+            q1.metric("Utilisé", f"{count} / {limit}")
+            q2.metric("Restant", f"{remaining}")
+            q3.metric("État", "ÉPUISÉ" if remaining == 0 else "DISPONIBLE")
+            st.write(f"**Début de période :** {quota_datetime(valid_from)}")
+            st.write(f"**Fin / renouvellement :** {quota_datetime(valid_until)}")
+            st.write(f"**Renouvellement automatique :** {'Oui' if auto_renew else 'Non / non indiqué'}")
+            if remaining == 0:
+                st.error("Quota épuisé : les appels facturables du scanner renverront 429 jusqu'au renouvellement ou à une augmentation du quota.")
+            else:
+                st.success(f"Il reste {remaining} requête(s) utilisable(s) pour le scanner.")
     except Exception as exc:
         st.error(str(exc))
 
