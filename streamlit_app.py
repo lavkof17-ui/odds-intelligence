@@ -1,560 +1,145 @@
-import re
-from datetime import datetime, timedelta, timezone
-from collections import defaultdict
+import streamlit as st, requests
+from datetime import datetime,timedelta,timezone
+from model_engine import build_model,predict,market_probability
 
-import requests
-import streamlit as st
+st.set_page_config(page_title='Odds Intelligence',page_icon='🎯',layout='centered')
+st.title('🎯 Odds Intelligence')
+st.caption('Scanner football • 1xBet • toutes les options disponibles • analyse indépendante quand possible')
+BASE='https://api.oddspapi.io/v4'; BOOK='1xbet'
+try: API_KEY=st.secrets['ODDS_API_KEY']
+except Exception: API_KEY=''
 
-st.set_page_config(page_title="Odds Intelligence", page_icon="🎯", layout="centered")
-
-BASE = "https://api.oddspapi.io/v4"
-BOOKMAKER = "1xbet"
-SPORT_ID = 10
-
-st.title("🎯 Odds Intelligence")
-st.caption("Scanner 1xBet • toutes les options disponibles • analyse et filtrage")
-
-
-class QuotaError(Exception):
-    pass
-
-
-@st.cache_data(ttl=30, show_spinner=False)
-def api_get(path, params_tuple):
-    key = st.secrets.get("ODDS_API_KEY", "")
-    if not key:
-        raise RuntimeError("Clé OddsPapi absente. Ajoute ODDS_API_KEY dans Streamlit → Secrets.")
-    params = dict(params_tuple)
-    params["apiKey"] = key
-    r = requests.get(f"{BASE}/{path}", params=params, timeout=60)
-    if r.status_code == 429:
-        raise QuotaError("Quota OddsPapi atteint (HTTP 429).")
-    if not r.ok:
-        raise RuntimeError(f"OddsPapi HTTP {r.status_code}: {r.text[:300]}")
+def api_get(path,params):
+    if not API_KEY: raise RuntimeError('Clé OddsPapi absente. Ajoute ODDS_API_KEY dans Streamlit → Secrets.')
+    p=dict(params); p['apiKey']=API_KEY
+    r=requests.get(f'{BASE}/{path}',params=p,timeout=60)
+    if r.status_code==429: raise RuntimeError('Quota OddsPapi atteint (HTTP 429).')
+    if not r.ok: raise RuntimeError(f'OddsPapi HTTP {r.status_code}: {r.text[:300]}')
     return r.json()
 
+def txt(d,*keys):
+    if not isinstance(d,dict): return ''
+    for k in keys:
+        v=d.get(k)
+        if isinstance(v,dict): v=v.get('name') or v.get('teamName') or v.get('shortName') or v.get('title')
+        if v not in (None,''): return str(v)
+    return ''
 
-def get_api(path, params=None):
-    return api_get(path, tuple(sorted((params or {}).items())))
+def fr_market(n):
+    mp={'Full Time Result':'Résultat final (1X2)','Both Teams To Score':'Les deux équipes marquent','Over Under Full Time':'Total buts — Plus/Moins','Asian Handicap':'Handicap asiatique','Double Chance':'Double chance','Draw No Bet':'Remboursé si nul','Half Time Result':'Résultat mi-temps','Over Under Half Time':'Total buts mi-temps — Plus/Moins','Correct Score':'Score exact'}
+    return mp.get((n or '').strip(),n or '')
 
+def outcome_label(o,market,line=None):
+    o=str(o or '').strip(); m=(market or '').lower()
+    if 'result' in m and o in ('1','X','2'): return {'1':'1 — Victoire équipe 1','X':'X — Match nul','2':'2 — Victoire équipe 2'}[o]
+    if o.lower() in ('yes','no'): return 'Oui' if o.lower()=='yes' else 'Non'
+    if o.lower() in ('over','under'):
+        return ('Plus de ' if o.lower()=='over' else 'Moins de ')+str(line) if line not in (None,'') else o
+    return o
 
-def text_value(obj, *keys):
-    if not isinstance(obj, dict):
-        return ""
-    for key in keys:
-        value = obj.get(key)
-        if isinstance(value, dict):
-            value = value.get("name") or value.get("teamName") or value.get("shortName") or value.get("title")
-        if value not in (None, ""):
-            return str(value)
-    return ""
+@st.cache_data(ttl=2592000,show_spinner=False)
+def markets_catalog():
+    data=api_get('markets',{'language':'en'})
+    out={}
+    if isinstance(data,list):
+        for m in data:
+            if not isinstance(m,dict): continue
+            mid=str(m.get('marketId')); out[mid]={'name':m.get('marketName') or f'Marché {mid}','outcomes':{}}
+            for o in m.get('outcomes') or []:
+                if isinstance(o,dict): out[mid]['outcomes'][str(o.get('outcomeId'))]=o.get('outcomeName') or ''
+    return out
 
-
-def parse_dt(value):
-    if not value:
-        return None
-    try:
-        dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
-        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
-    except Exception:
-        return None
-
-
-def display_time(value):
-    dt = parse_dt(value)
-    if not dt:
-        return str(value or "")
-    return dt.astimezone(timezone.utc).strftime("%d/%m/%Y %H:%M UTC")
-
-
-def line_from(value):
-    if value in (None, ""):
-        return None
-    for part in str(value).split("/"):
-        try:
-            number = float(part)
-            if -100 <= number <= 100:
-                return number
-        except Exception:
-            continue
-    return None
-
-
-def fmt_line(value):
-    if value is None:
-        return ""
-    try:
-        f = float(value)
-        return str(int(f)) if f.is_integer() else str(f).rstrip("0").rstrip(".")
-    except Exception:
-        return str(value)
-
-
-def translate_market(raw):
-    n = str(raw or "").strip()
-    low = n.lower()
-    rules = [
-        ("full time result", "Résultat final (1X2)"),
-        ("match result", "Résultat final (1X2)"),
-        ("double chance", "Double chance"),
-        ("both teams to score", "Les deux équipes marquent"),
-        ("over under", "Total / Plus-Moins"),
-        ("over/under", "Total / Plus-Moins"),
-        ("total goals", "Total buts"),
-        ("asian handicap", "Handicap asiatique"),
-        ("european handicap", "Handicap européen"),
-        ("draw no bet", "Remboursé si nul"),
-        ("half time result", "Résultat mi-temps"),
-        ("correct score", "Score exact"),
-        ("first half", "1re mi-temps"),
-        ("second half", "2e mi-temps"),
-    ]
-    for needle, label in rules:
-        if needle in low:
-            return label
-    return n or "Marché inconnu"
-
-
-def outcome_label(raw, raw_market, home, away, line=None, bookmaker_outcome_id=""):
-    value = str(raw or "").strip()
-    low = value.lower()
-    market_low = str(raw_market or "").lower()
-    boid = str(bookmaker_outcome_id or "").lower()
-    tail = boid.split("/")[-1] if "/" in boid else ""
-    token = tail if tail in {"over", "under", "yes", "no", "home", "away", "1", "x", "2"} else low
-
-    if token == "1" and ("result" in market_low or "1x2" in market_low):
-        return f"1 — {home}"
-    if token == "x" and ("result" in market_low or "1x2" in market_low):
-        return "X — Match nul"
-    if token == "2" and ("result" in market_low or "1x2" in market_low):
-        return f"2 — {away}"
-    if token == "over":
-        return f"Plus de {fmt_line(line)}" if line is not None else "Plus de"
-    if token == "under":
-        return f"Moins de {fmt_line(line)}" if line is not None else "Moins de"
-    if token == "yes":
-        return "Oui"
-    if token == "no":
-        return "Non"
-    if token == "home":
-        return home
-    if token == "away":
-        return away
-    return value or str(bookmaker_outcome_id or "Sélection")
-
-
-@st.cache_data(ttl=21600, show_spinner=False)
-def market_catalog():
-    data = get_api("markets", {"language": "en"})
-    result = {}
-    if not isinstance(data, list):
-        return result
-    for market in data:
-        if not isinstance(market, dict):
-            continue
-        mid = str(market.get("marketId", ""))
-        if not mid:
-            continue
-        outcomes = {}
-        for outcome in market.get("outcomes") or []:
-            if isinstance(outcome, dict):
-                oid = str(outcome.get("outcomeId", ""))
-                if oid:
-                    outcomes[oid] = outcome.get("outcomeName") or ""
-        result[mid] = {
-            "name": market.get("marketName") or "",
-            "outcomes": outcomes,
-            "handicap": market.get("handicap"),
-        }
-    return result
-
-
-def extract_fixtures(data):
-    if isinstance(data, list):
-        return data
-    if isinstance(data, dict):
-        for key in ("data", "fixtures", "results"):
-            if isinstance(data.get(key), list):
-                return data[key]
-        return [data]
-    return []
-
-
-def fixture_names(item):
-    home = text_value(item, "participant1Name", "homeTeamName", "homeName", "home")
-    away = text_value(item, "participant2Name", "awayTeamName", "awayName", "away")
-    participants = item.get("participants") or item.get("teams") or []
-    if isinstance(participants, list):
-        vals = [text_value(p, "name", "teamName", "shortName", "title") for p in participants if isinstance(p, dict)]
-        vals = [v for v in vals if v]
-        if len(vals) >= 2:
-            home = home or vals[0]
-            away = away or vals[1]
-    return home, away
-
-
-def parse_quotes(item, catalog):
-    bookmaker_odds = item.get("bookmakerOdds") or {}
-    board = bookmaker_odds.get(BOOKMAKER)
-    if not isinstance(board, dict) and bookmaker_odds:
-        board = next(iter(bookmaker_odds.values()))
-    if not isinstance(board, dict):
-        return []
-
-    markets = board.get("markets") or {}
-    market_items = markets.items() if isinstance(markets, dict) else enumerate(markets)
-    rows = []
-
-    for market_id, market_data in market_items:
-        if not isinstance(market_data, dict):
-            continue
-        mid = str(market_id)
-        meta = catalog.get(mid, {})
-        raw_market = meta.get("name") or market_data.get("marketName") or f"Marché {mid}"
-        market_name = translate_market(raw_market)
-        base_line = meta.get("handicap")
-        outcomes = market_data.get("outcomes") or {}
-        outcome_items = outcomes.items() if isinstance(outcomes, dict) else enumerate(outcomes)
-
-        for outcome_id, outcome_data in outcome_items:
-            if not isinstance(outcome_data, dict):
-                continue
-            players = outcome_data.get("players")
-            legs = list(players.values()) if isinstance(players, dict) else (players if isinstance(players, list) else [outcome_data])
+def parse_fixture(board,cat):
+    rows=[]; markets=(board or {}).get('markets') or {}
+    for mid,m in markets.items() if isinstance(markets,dict) else []:
+        if not isinstance(m,dict) or m.get('marketActive') is False: continue
+        meta=cat.get(str(mid),{}); rawm=meta.get('name') or m.get('marketName') or f'Marché {mid}'; names=meta.get('outcomes',{})
+        for oid,o in (m.get('outcomes') or {}).items():
+            if not isinstance(o,dict): continue
+            players=o.get('players')
+            legs=list(players.values()) if isinstance(players,dict) else ([o] if not isinstance(players,list) else players)
             for leg in legs:
-                if not isinstance(leg, dict):
-                    continue
-                if leg.get("active", outcome_data.get("active", True)) is False:
-                    continue
-                try:
-                    odds = float(leg.get("price", outcome_data.get("price")))
-                except Exception:
-                    continue
-                if odds <= 1:
-                    continue
-                boid = str(leg.get("bookmakerOutcomeId") or "")
-                line = leg.get("line") or outcome_data.get("line")
-                if line in (None, ""):
-                    line = line_from(boid)
-                if line in (None, "") and base_line not in (None, ""):
-                    line = line_from(base_line)
-                raw_outcome = (
-                    leg.get("outcomeName") or leg.get("name") or leg.get("label")
-                    or catalog.get(mid, {}).get("outcomes", {}).get(str(outcome_id))
-                    or outcome_data.get("outcomeName") or str(outcome_id)
-                )
-                rows.append({
-                    "market_id": mid,
-                    "outcome_id": str(outcome_id),
-                    "market": market_name,
-                    "raw_market": raw_market,
-                    "selection": outcome_label(raw_outcome, raw_market, "", "", line, boid),
-                    "raw_selection": str(raw_outcome),
-                    "line": line,
-                    "odds": odds,
-                    "boid": boid,
-                })
+                if not isinstance(leg,dict) or leg.get('active',True) is False: continue
+                try: price=float(leg.get('price',o.get('price')))
+                except: continue
+                boid=str(leg.get('bookmakerOutcomeId') or '')
+                raw=leg.get('outcomeName') or leg.get('name') or leg.get('label') or names.get(str(oid)) or o.get('outcomeName') or boid or str(oid)
+                line=leg.get('line') or o.get('line')
+                if line in (None,'') and '/' in boid:
+                    left,_=boid.split('/',1)
+                    try: line=float(left)
+                    except: pass
+                rows.append({'market_id':str(mid),'outcome_id':str(oid),'market_raw':rawm,'market':fr_market(rawm),'outcome_raw':str(raw),'outcome':outcome_label(raw,rawm,line),'line':line,'odds':price})
     return rows
 
+def tm(v):
+    try:return datetime.fromisoformat(str(v).replace('Z','+00:00')).strftime('%d/%m %H:%M UTC')
+    except:return str(v or '')
 
-def market_probability(rows):
-    """Normalize inverse odds within comparable market/line groups.
-    This is a market-adjusted probability, not an independent prediction.
-    """
-    groups = defaultdict(list)
-    for row in rows:
-        key = (row["market_id"], fmt_line(row.get("line")))
-        groups[key].append(row)
-    for group in groups.values():
-        denom = sum(1.0 / r["odds"] for r in group if r["odds"] > 1)
-        for r in group:
-            r["implied"] = 100.0 / r["odds"]
-            r["estimated"] = 100.0 * (1.0 / r["odds"]) / denom if denom else r["implied"]
-            r["edge"] = r["estimated"] - r["implied"]
-            r["market_margin"] = sum(1.0 / x["odds"] for x in group if x["odds"] > 1) * 100 - 100
-    return rows
-
-
-def build_fixtures(hours):
-    now = datetime.now(timezone.utc)
-    end = now + timedelta(hours=hours)
-
-    # One scoped fixture call first. This identifies only tournaments that actually
-    # have matches in the requested window, then odds are retrieved in bulk.
-    fixtures_data = get_api("fixtures", {
-        "sportId": SPORT_ID,
-        "from": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "to": end.strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "statusId": 0,
-        "hasOdds": "true",
-        "bookmakers": BOOKMAKER,
-        "language": "en",
-    })
-    fixture_seed = extract_fixtures(fixtures_data)
-    tournament_ids = []
-    seed_by_id = {}
-    for item in fixture_seed:
-        if not isinstance(item, dict):
-            continue
-        fid = item.get("fixtureId")
-        tid = item.get("tournamentId")
-        dt = parse_dt(item.get("startTime"))
-        if not fid or tid is None or not dt or not (now <= dt <= end):
-            continue
-        seed_by_id[str(fid)] = item
-        if str(tid) not in tournament_ids:
-            tournament_ids.append(str(tid))
-
-    if not tournament_ids:
-        return [], {"seed": len(fixture_seed), "tournaments": 0}
-
-    catalog = market_catalog()
-    raw = []
-    for i in range(0, len(tournament_ids), 100):
-        chunk = tournament_ids[i:i + 100]
-        data = get_api("odds-by-tournaments", {
-            "tournamentIds": ",".join(chunk),
-            "bookmakers": BOOKMAKER,
-            "language": "en",
-            "verbosity": 3,
-        })
-        raw.extend(extract_fixtures(data))
-
-    fixtures = []
-    seen = set()
-    for item in raw:
-        if not isinstance(item, dict):
-            continue
-        fid = str(item.get("fixtureId") or "")
-        if not fid or fid in seen:
-            continue
-        seed = seed_by_id.get(fid, {})
-        dt = parse_dt(item.get("startTime") or seed.get("startTime"))
-        if not dt or not (now <= dt <= end):
-            continue
-        home, away = fixture_names(item)
-        sh, sa = fixture_names(seed)
-        home, away = home or sh, away or sa
-        if not home or not away:
-            continue
-        league = (
-            item.get("tournamentName") or item.get("leagueName") or item.get("competitionName")
-            or seed.get("tournamentName") or seed.get("leagueName") or seed.get("competitionName") or ""
-        )
-        quotes = parse_quotes(item, catalog)
-        for q in quotes:
-            q["home"] = home
-            q["away"] = away
-            q["league"] = league
-            q["start"] = dt.isoformat()
-            # Rebuild the human-readable selection now that team names are known.
-            q["selection"] = outcome_label(q.get("raw_selection"), q.get("raw_market"), home, away, q.get("line"), q.get("boid"))
-            q["fixture_id"] = fid
-        quotes = market_probability(quotes)
-        fixtures.append({
-            "fixture_id": fid,
-            "home": home,
-            "away": away,
-            "league": league,
-            "start": dt.isoformat(),
-            "quotes": quotes,
-        })
-        seen.add(fid)
-    return fixtures, {"seed": len(fixture_seed), "tournaments": len(tournament_ids), "fixtures": len(fixtures)}
-
-
-def account_status():
-    """Read quota from the active subscription returned by /v4/account.
-    OddsPapi nests request_limit/request_count/valid_until inside subscriptions[].
-    """
-    data = get_api("account")
-    root = data if isinstance(data, dict) else {}
-
-    # Current API shape: {subscriptions: [{...request_limit...}]}
-    subscriptions = root.get("subscriptions")
-    if isinstance(subscriptions, list):
-        active = [s for s in subscriptions if isinstance(s, dict) and s.get("is_active")]
-        candidates = active or [s for s in subscriptions if isinstance(s, dict)]
-        if candidates:
-            sub = candidates[0]
-            limit = sub.get("request_limit")
-            count = sub.get("request_count")
-            valid_from = sub.get("valid_from")
-            valid_until = sub.get("valid_until")
-            auto_renew = sub.get("auto_renew")
-            remaining = None
-            try:
-                if limit is not None and count is not None:
-                    remaining = max(0, int(limit) - int(count))
-            except Exception:
-                pass
-            return limit, count, remaining, valid_from, valid_until, auto_renew
-
-    # Fallback for alternative/older response shapes.
-    candidates = [root]
-    for key in ("account", "data", "user"):
-        if isinstance(root.get(key), dict):
-            candidates.append(root[key])
-    limit = count = valid_from = valid_until = auto_renew = None
-    for d in candidates:
-        if limit is None: limit = d.get("request_limit")
-        if count is None: count = d.get("request_count")
-        if valid_from is None: valid_from = d.get("valid_from")
-        if valid_until is None: valid_until = d.get("valid_until")
-        if auto_renew is None: auto_renew = d.get("auto_renew")
-    remaining = None
-    try:
-        if limit is not None and count is not None:
-            remaining = max(0, int(limit) - int(count))
-    except Exception:
-        pass
-    return limit, count, remaining, valid_from, valid_until, auto_renew
-
-
-def quota_datetime(value):
-    dt = parse_dt(value)
-    if not dt:
-        return value or "non indiquée"
-    return dt.astimezone(timezone.utc).strftime("%d/%m/%Y %H:%M UTC")
-
-
-# ---------------- UI ----------------
 with st.container(border=True):
-    st.subheader("🔎 Recherche")
-    c1, c2 = st.columns(2)
-    min_odds = c1.number_input("Cote minimum", min_value=1.01, max_value=100.0, value=1.50, step=0.01)
-    max_odds = c2.number_input("Cote maximum", min_value=1.01, max_value=100.0, value=2.00, step=0.01)
-    c3, c4 = st.columns(2)
-    min_prob = c3.number_input("Probabilité estimée minimum (%)", min_value=0.0, max_value=99.9, value=60.0, step=1.0)
-    hours = c4.selectbox("Fenêtre", [6, 12, 24, 36, 48], index=2, format_func=lambda x: f"{x} h")
-
-    # We can only populate the exact bookmaker market list after the catalogue is loaded.
-    api_key_present = bool(st.secrets.get("ODDS_API_KEY", ""))
-    market_options = ["Tous les marchés"]
-    if api_key_present:
-        try:
-            cat = market_catalog()
-            market_options += sorted({translate_market(v.get("name")) for v in cat.values() if v.get("name")})
-        except Exception:
-            pass
-    market = st.selectbox("Marché", list(dict.fromkeys(market_options)))
-
-    c5, c6, c7 = st.columns(3)
-    sort_mode = c5.selectbox("Trier par", ["Probabilité décroissante", "Cote croissante", "Value marché décroissante", "Coup d'envoi"])
-    only_positive_edge = c6.checkbox("Afficher seulement l'écart positif", value=False)
-    c7.write("Toutes les options 1xBet : **OUI**")
-
-    b1, b2, b3 = st.columns(3)
-    scan = b1.button("🔎 SCANNER 1xBET", use_container_width=True, type="primary")
-    demo = b2.button("🧪 DÉMO", use_container_width=True)
-    quota_btn = b3.button("📊 QUOTA", use_container_width=True)
-
-if quota_btn:
-    try:
-        limit, count, remaining, valid_from, valid_until, auto_renew = account_status()
-        if limit is None or count is None:
-            st.warning("OddsPapi a répondu, mais aucun quota actif n'a pu être identifié dans /v4/account.")
-        else:
-            st.subheader("📊 Quota OddsPapi")
-            q1, q2, q3 = st.columns(3)
-            q1.metric("Utilisé", f"{count} / {limit}")
-            q2.metric("Restant", f"{remaining}")
-            q3.metric("État", "ÉPUISÉ" if remaining == 0 else "DISPONIBLE")
-            st.write(f"**Début de période :** {quota_datetime(valid_from)}")
-            st.write(f"**Fin / renouvellement :** {quota_datetime(valid_until)}")
-            st.write(f"**Renouvellement automatique :** {'Oui' if auto_renew else 'Non / non indiqué'}")
-            if remaining == 0:
-                st.error("Quota épuisé : les appels facturables du scanner renverront 429 jusqu'au renouvellement ou à une augmentation du quota.")
-            else:
-                st.success(f"Il reste {remaining} requête(s) utilisable(s) pour le scanner.")
-    except Exception as exc:
-        st.error(str(exc))
-
-if demo:
-    demo_rows = [
-        {"home":"Japon", "away":"Nouvelle-Zélande", "league":"Démo", "market":"Résultat final (1X2)", "selection":"1 — Japon", "odds":1.72, "estimated":64.7, "implied":58.1, "edge":6.6, "line":None},
-        {"home":"Japon", "away":"Nouvelle-Zélande", "league":"Démo", "market":"Total / Plus-Moins", "selection":"Plus de 1.5", "odds":1.55, "estimated":78.1, "implied":64.5, "edge":13.6, "line":1.5},
-        {"home":"Japon", "away":"Nouvelle-Zélande", "league":"Démo", "market":"Les deux équipes marquent", "selection":"Oui", "odds":1.80, "estimated":58.0, "implied":55.6, "edge":2.4, "line":None},
-    ]
-    rows = [r for r in demo_rows if min_odds <= r["odds"] <= max_odds and r["estimated"] >= min_prob and (market == "Tous les marchés" or r["market"] == market)]
-    if only_positive_edge:
-        rows = [r for r in rows if r["edge"] > 0]
-    st.session_state.rows = rows
-    st.session_state.note = "Mode démo — chiffres illustratifs"
+    a,b=st.columns(2); min_odds=a.number_input('Cote min',1.01,100.0,1.10,0.01); max_odds=b.number_input('Cote max',1.01,100.0,1.50,0.01)
+    c,d=st.columns(2); min_prob=c.number_input('Probabilité modèle min (%)',0.0,99.9,80.0,1.0); hours=d.selectbox('Fenêtre',[6,12,24,36,48],index=2,format_func=lambda x:f'{x} h')
+    e,f=st.columns(2); only_model=e.checkbox('Afficher seulement les marchés analysables',True); positive=f.checkbox('Afficher seulement la value positive',False)
+    scan=st.button('🔎 SCANNER 1xBET',use_container_width=True,type='primary')
 
 if scan:
-    st.session_state.rows = []
-    st.session_state.note = ""
-    if max_odds < min_odds:
-        st.error("La cote maximum doit être supérieure ou égale à la cote minimum.")
-    elif not api_key_present:
-        st.error("Clé OddsPapi absente dans Streamlit → Secrets.")
-    else:
-        try:
-            with st.spinner("Récupération des matchs et de toutes les options 1xBet…"):
-                fixtures, meta = build_fixtures(hours)
-            rows = []
-            for fixture in fixtures:
-                for quote in fixture["quotes"]:
-                    if not (min_odds <= quote["odds"] <= max_odds):
-                        continue
-                    if quote["estimated"] < min_prob:
-                        continue
-                    if market != "Tous les marchés" and quote["market"] != market:
-                        continue
-                    if only_positive_edge and quote["edge"] <= 0:
-                        continue
-                    rows.append(quote)
-            if sort_mode == "Probabilité décroissante":
-                rows.sort(key=lambda x: (x["estimated"], x["edge"]), reverse=True)
-            elif sort_mode == "Cote croissante":
-                rows.sort(key=lambda x: x["odds"])
-            elif sort_mode == "Value marché décroissante":
-                rows.sort(key=lambda x: x["edge"], reverse=True)
-            else:
-                rows.sort(key=lambda x: parse_dt(x.get("start")) or datetime.max.replace(tzinfo=timezone.utc))
-            st.session_state.rows = rows
-            st.session_state.note = f"{meta.get('fixtures', 0)} match(s) • {len(rows)} sélection(s) correspondant à tes critères • tous les marchés 1xBet récupérés pour ces matchs"
-        except QuotaError:
-            st.error("Quota OddsPapi atteint (HTTP 429). Le scanner ne peut pas récupérer de nouvelles cotes tant que le quota n'est pas renouvelé ou augmenté.")
-        except Exception as exc:
-            st.error(str(exc))
+    if max_odds<min_odds: st.error('La cote max doit être supérieure ou égale à la cote min.'); st.stop()
+    if not API_KEY: st.error('Clé OddsPapi absente dans Streamlit → Secrets.'); st.stop()
+    try:
+        cat=markets_catalog()
+        now=datetime.now(timezone.utc); end=now+timedelta(hours=hours)
+        fs=api_get('fixtures',{'sportId':10,'from':now.strftime('%Y-%m-%dT%H:%M:%SZ'),'to':end.strftime('%Y-%m-%dT%H:%M:%SZ'),'statusId':0,'hasOdds':'true','bookmakers':BOOK,'language':'en'})
+        fs=fs if isinstance(fs,list) else []
+        tids=sorted({str(f.get('tournamentId')) for f in fs if isinstance(f,dict) and f.get('tournamentId') is not None})
+        if not tids: st.session_state.rows=[]; st.session_state.note='Aucun match avec cotes sur la fenêtre choisie.'; st.stop()
+        od=api_get('odds-by-tournaments',{'tournamentIds':','.join(tids),'bookmakers':BOOK,'language':'en','verbosity':3})
+        events=od if isinstance(od,list) else list(od.values()) if isinstance(od,dict) else []
+        wanted={str(f.get('fixtureId')):f for f in fs if isinstance(f,dict)}
+        # Build one independent model only when needed. Historical data is external and does not consume OddsPapi quota.
+        model=None
+        rows=[]; analyzable=0
+        for ev in events:
+            if not isinstance(ev,dict) or str(ev.get('fixtureId')) not in wanted or ev.get('statusId') not in (0,None): continue
+            f=wanted[str(ev.get('fixtureId'))]; h=txt(ev,'participant1Name','homeTeamName') or txt(f,'participant1Name','homeTeamName'); a=txt(ev,'participant2Name','awayTeamName') or txt(f,'participant2Name','awayTeamName')
+            league=txt(ev,'tournamentName') or txt(f,'tournamentName') or txt(f,'leagueName')
+            board=(ev.get('bookmakerOdds') or {}).get(BOOK)
+            for q in parse_fixture(board,cat):
+                if not(min_odds<=q['odds']<=max_odds): continue
+                if model is None:
+                    try:model=build_model(365)
+                    except Exception:model={}
+                pred=predict(h,a,model) if model else None
+                mp=market_probability(q['market_raw'],q['outcome_raw'],q['line'],pred)
+                if mp is None:
+                    if only_model: continue
+                    q.update({'estimated':None,'edge':None,'value':None,'analysis':'Non modélisé indépendamment'})
+                else:
+                    analyzable+=1; implied=1/q['odds']; edge=mp-implied; value=mp*q['odds']-1
+                    if mp*100<min_prob or (positive and value<=0): continue
+                    q.update({'estimated':mp*100,'implied':implied*100,'edge':edge*100,'value':value*100,'analysis':'Modèle Poisson indépendant'})
+                q.update({'home':h,'away':a,'league':league,'start':ev.get('startTime') or f.get('startTime'),'fixture_id':ev.get('fixtureId')})
+                rows.append(q)
+        rows.sort(key=lambda r: ((r.get('value') is not None),r.get('value') or -999,r.get('estimated') or -1),reverse=True)
+        st.session_state.rows=rows; st.session_state.note=f'{len(wanted)} match(s) • {len(rows)} option(s) retenue(s) • {analyzable} analysée(s) indépendamment'
+    except Exception as e:
+        st.error(str(e)); st.session_state.rows=[]; st.session_state.note=''
 
-rows = st.session_state.get("rows", [])
-note = st.session_state.get("note", "")
-if note:
-    st.info(note)
-
-if rows:
-    st.success(f"{len(rows)} pari(s) trouvé(s)")
-    for r in rows:
-        est = float(r.get("estimated", 0))
-        imp = float(r.get("implied", 0))
-        edge = float(r.get("edge", 0))
-        if est >= 70:
-            badge = "🔥 FORTE"
-        elif est >= 60:
-            badge = "🟢 INTÉRESSANTE"
+rows=st.session_state.get('rows',[]); note=st.session_state.get('note','')
+if note: st.info(note)
+for r in rows:
+    with st.container(border=True):
+        st.subheader(f"{r.get('home','')} — {r.get('away','')}"); st.caption(f"{r.get('league','')} • {tm(r.get('start'))}")
+        st.write(f"**Marché :** {r.get('market','')}")
+        st.write(f"**Pari :** {r.get('outcome','')}")
+        if r.get('line') not in (None,''): st.caption(f"Ligne : {r['line']}")
+        c1,c2=st.columns(2); c1.metric('Cote 1xBet',f"{r['odds']:.2f}")
+        if r.get('estimated') is not None:
+            c2.metric('Probabilité modèle',f"{r['estimated']:.1f}%")
+            st.write(f"Probabilité implicite : **{r['implied']:.1f}%** • Écart : **{r['edge']:+.1f} points** • Value théorique : **{r['value']:+.1f}%**")
         else:
-            badge = "⚪ STANDARD"
-        with st.container(border=True):
-            st.subheader(f"{r.get('home', '')} — {r.get('away', '')}")
-            st.caption(f"{r.get('league', '')} • {display_time(r.get('start'))}")
-            st.write(f"**Marché :** {r.get('market', '')}")
-            st.write(f"**Pari :** {r.get('selection', '')}")
-            if r.get("line") not in (None, ""):
-                st.caption(f"Ligne : {fmt_line(r['line'])}")
-            a, b, c = st.columns(3)
-            a.metric("Cote 1xBet", f"{r['odds']:.2f}")
-            b.metric("Prob. estimée", f"{est:.1f}%")
-            c.metric("Écart", f"{edge:+.1f} pt")
-            st.write(f"**Probabilité implicite :** {imp:.1f}%  •  **{badge}**")
-            st.caption("Analyse actuelle = probabilité du marché corrigée de la marge des issues comparables. Elle n'est pas une garantie et ne doit pas être présentée comme une prédiction indépendante.")
-else:
-    if note:
-        st.warning("Aucun pari ne correspond aux critères.")
+            c2.metric('Analyse','Non modélisée')
+            st.caption('Option détectée chez 1xBet, mais le modèle ne produit pas de probabilité fiable pour ce marché.')
 
-st.divider()
-st.caption("Principe : l'application récupère les matchs de la fenêtre choisie, puis toutes les options de paris 1xBet disponibles pour ces matchs. Tes filtres servent ensuite à sélectionner ce que tu veux voir.")
-st.caption("Important : les marchés non standardisés sont affichés tels que fournis par OddsPapi. La probabilité estimée universelle est une probabilité de marché ajustée, pas un modèle sportif indépendant.")
+if not rows and note: st.warning('Aucune option ne correspond aux critères.')
+st.divider(); st.caption('Le scanner récupère les options effectivement exposées par 1xBet. Le modèle n’invente pas de probabilité : il ne calcule que les marchés actuellement supportés (1X2, BTTS, total buts FT, score exact). Les autres restent détectables mais non analysés si tu les affiches.')
+st.caption('La probabilité modèle est indépendante des cotes 1xBet ; la cote sert ensuite uniquement à calculer probabilité implicite, écart et value théorique. Aucun résultat ne garantit un gain.')
