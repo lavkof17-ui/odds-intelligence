@@ -28,7 +28,55 @@ def api_get(path, params=None):
     except requests.RequestException as exc:
         raise RuntimeError(f"Connexion OddsPapi impossible : {exc}") from exc
     if response.status_code == 429:
-        raise RuntimeError("Quota OddsPapi atteint (HTTP 429). Aucun nouvel appel de scan ne sera tenté.")
+        # OddsPapi utilise HTTP 429 pour DEUX situations distinctes :
+        # REQUEST_LIMIT_EXCEEDED = quota mensuel épuisé
+        # RATE_LIMITED = endpoint appelé trop rapidement
+        try:
+            error_body = response.json()
+        except ValueError:
+            error_body = {}
+        err = error_body.get("error", error_body) if isinstance(error_body, dict) else {}
+        code = str(err.get("code", "")).upper() if isinstance(err, dict) else ""
+        message = err.get("message", "") if isinstance(err, dict) else ""
+        details = err.get("details", "") if isinstance(err, dict) else ""
+
+        if code == "REQUEST_LIMIT_EXCEEDED":
+            raise RuntimeError(
+                f"Quota mensuel OddsPapi réellement épuisé ({code}) : "
+                f"{details or message or 'limite mensuelle atteinte'}"
+            )
+
+        if code == "RATE_LIMITED":
+            retry_ms = err.get("retryMs", 1000) if isinstance(err, dict) else 1000
+            try:
+                wait_seconds = max(1.0, min(float(retry_ms) / 1000.0 + 0.25, 15.0))
+            except (TypeError, ValueError):
+                wait_seconds = 1.5
+            time.sleep(wait_seconds)
+            # Une seule reprise après le délai demandé par le fournisseur.
+            response = requests.get(f"{BASE}/{path}", params=p, timeout=45)
+            if response.status_code == 429:
+                try:
+                    retry_body = response.json()
+                except ValueError:
+                    retry_body = {}
+                retry_err = retry_body.get("error", retry_body) if isinstance(retry_body, dict) else {}
+                retry_code = retry_err.get("code", "UNKNOWN") if isinstance(retry_err, dict) else "UNKNOWN"
+                retry_details = retry_err.get("details", "") if isinstance(retry_err, dict) else ""
+                if retry_code == "REQUEST_LIMIT_EXCEEDED":
+                    raise RuntimeError(
+                        f"Quota mensuel OddsPapi réellement épuisé ({retry_code}) : {retry_details}"
+                    )
+                raise RuntimeError(
+                    f"Limitation temporaire OddsPapi persistante ({retry_code}). "
+                    f"{retry_details or 'Attends avant de relancer le scan.'}"
+                )
+        else:
+            raise RuntimeError(
+                f"OddsPapi HTTP 429 — code {code or 'non précisé'} : "
+                f"{details or message or response.text[:250]}. "
+                "Le quota mensuel n'est pas déclaré épuisé sans le code REQUEST_LIMIT_EXCEEDED."
+            )
     if response.status_code in (401, 403):
         raise RuntimeError("Clé API refusée ou accès non autorisé. Vérifie ODDS_API_KEY dans Streamlit → Secrets.")
     if not response.ok:
