@@ -365,6 +365,9 @@ if scan:
             events, actual_batches = fetch_odds_for_tournaments(tournament_ids, BOOK)
             wanted = {str(f.get("fixtureId")): f for f in fixtures if isinstance(f, dict)}
             model, rows, analyzable = None, [], 0
+            odds_in_range = 0
+            matches_with_odds = set()
+            unsupported_count = 0
 
             for event in events:
                 if not isinstance(event, dict) or str(event.get("fixtureId")) not in wanted or event.get("statusId") not in (0, None):
@@ -378,6 +381,9 @@ if scan:
                 for item in parse_fixture(board, catalog):
                     if not (min_odds <= item["odds"] <= max_odds):
                         continue
+                    odds_in_range += 1
+                    matches_with_odds.add(str(event.get("fixtureId")))
+
                     if model is None:
                         try:
                             model = build_model(365)
@@ -386,34 +392,54 @@ if scan:
                     prediction = predict(home, away, model) if model else None
                     probability = market_probability(item["market_raw"], item["outcome_raw"], item["line"], prediction)
 
-                    if probability is None:
-                        if only_model:
-                            continue
-                        item.update({"estimated": None, "edge": None, "value": None, "analysis": "Non modélisé indépendamment"})
-                    else:
-                        analyzable += 1
-                        implied = 1 / item["odds"]
-                        edge = probability - implied
-                        value = probability * item["odds"] - 1
-                        if probability * 100 < min_prob or (positive and value <= 0):
-                            continue
-                        item.update({
-                            "estimated": probability * 100, "implied": implied * 100,
-                            "edge": edge * 100, "value": value * 100,
-                            "analysis": "Modèle Poisson indépendant"
-                        })
                     item.update({
                         "home": home, "away": away, "league": league,
                         "start": event.get("startTime") or fixture.get("startTime"),
                         "fixture_id": event.get("fixtureId")
                     })
+
+                    if probability is None:
+                        unsupported_count += 1
+                        if only_model:
+                            continue
+                        item.update({
+                            "estimated": None, "implied": 1 / item["odds"] * 100,
+                            "edge": None, "value": None,
+                            "analysis": "Marché non pris en charge par le modèle",
+                            "passes_filters": False,
+                            "filter_reason": "Probabilité non calculable"
+                        })
+                    else:
+                        analyzable += 1
+                        implied = 1 / item["odds"]
+                        edge = probability - implied
+                        value = probability * item["odds"] - 1
+                        passes_probability = probability * 100 >= min_prob
+                        passes_value = (not positive) or value > 0
+                        item.update({
+                            "estimated": probability * 100, "implied": implied * 100,
+                            "edge": edge * 100, "value": value * 100,
+                            "analysis": "Modèle Poisson indépendant",
+                            "passes_filters": passes_probability and passes_value,
+                            "filter_reason": (
+                                "Critères respectés" if passes_probability and passes_value
+                                else "Probabilité sous le minimum demandé" if not passes_probability
+                                else "Value théorique non positive"
+                            )
+                        })
                     rows.append(item)
 
-            rows.sort(key=lambda r: (r.get("value") is not None, r.get("value") or -999, r.get("estimated") or -1), reverse=True)
+            rows.sort(key=lambda r: (
+                r.get("passes_filters", False),
+                r.get("value") if r.get("value") is not None else -999,
+                r.get("estimated") if r.get("estimated") is not None else -1
+            ), reverse=True)
+            qualified = sum(1 for r in rows if r.get("passes_filters"))
             st.session_state.rows = rows
             st.session_state.note = (
-                f"{len(wanted)} match(s) • {len(rows)} option(s) retenue(s) • "
-                f"{analyzable} analysée(s) indépendamment • {actual_batches} lot(s) de tournois"
+                f"{len(wanted)} matchs récupérés • {len(matches_with_odds)} avec options dans ta fourchette "
+                f"• {odds_in_range} options dans la fourchette • {analyzable} analysables "
+                f"• {qualified} respectent tous tes critères • {actual_batches} lots"
             )
 
         # Rafraîchit le compteur après le scan.
@@ -428,25 +454,51 @@ rows = st.session_state.get("rows", [])
 note = st.session_state.get("note", "")
 if note:
     st.info(note)
-for row in rows:
-    with st.container(border=True):
-        st.subheader(f"{row.get('home', '')} — {row.get('away', '')}")
-        st.caption(f"{row.get('league', '')} • {format_time(row.get('start'))}")
-        st.write(f"**Marché :** {row.get('market', '')}")
-        st.write(f"**Pari :** {row.get('outcome', '')}")
-        if row.get("line") not in (None, ""):
-            st.caption(f"Ligne : {row['line']}")
-        a, b = st.columns(2)
-        a.metric("Cote 1xBet", f"{row['odds']:.2f}")
-        if row.get("estimated") is not None:
-            b.metric("Probabilité modèle", f"{row['estimated']:.1f}%")
-            st.write(f"Probabilité implicite : **{row['implied']:.1f}%** • Écart : **{row['edge']:+.1f} points** • Value théorique : **{row['value']:+.1f}%**")
-        else:
-            b.metric("Analyse", "Non modélisée")
-            st.caption("Option détectée chez 1xBet, mais le modèle ne produit pas de probabilité fiable pour ce marché.")
+qualified_rows = [r for r in rows if r.get("passes_filters")]
+other_rows = [r for r in rows if not r.get("passes_filters")]
+
+if rows:
+    st.subheader(f"✅ Options qui respectent tous les critères ({len(qualified_rows)})")
+    if not qualified_rows:
+        st.info("Aucune option ne satisfait tous les filtres. Les analyses calculées apparaissent juste en dessous : tu peux ainsi voir les probabilités même lorsqu'elles sont sous ton seuil.")
+    for row in qualified_rows:
+        with st.container(border=True):
+            st.subheader(f"{row.get('home', '')} — {row.get('away', '')}")
+            st.caption(f"{row.get('league', '')} • {format_time(row.get('start'))}")
+            st.write(f"**Marché :** {row.get('market', '')}")
+            st.write(f"**Pari :** {row.get('outcome', '')}")
+            if row.get("line") not in (None, ""):
+                st.caption(f"Ligne : {row['line']}")
+            a, b = st.columns(2)
+            a.metric("Cote 1xBet", f"{row['odds']:.2f}")
+            if row.get("estimated") is not None:
+                b.metric("Probabilité modèle", f"{row['estimated']:.1f}%")
+                st.write(f"Probabilité implicite : **{row['implied']:.1f}%** • Écart : **{row['edge']:+.1f} points** • Value théorique : **{row['value']:+.1f}%**")
+            else:
+                b.metric("Analyse", "Non modélisée")
+                st.caption("Probabilité non calculable par le modèle.")
+
+    if other_rows:
+        st.subheader(f"📋 Autres options analysées ou détectées ({len(other_rows)})")
+        for row in other_rows:
+            with st.container(border=True):
+                st.write(f"**{row.get('home', '')} — {row.get('away', '')}**")
+                st.caption(f"{row.get('league', '')} • {format_time(row.get('start'))}")
+                st.write(f"{row.get('market', '')} — **{row.get('outcome', '')}**")
+                a, b = st.columns(2)
+                a.metric("Cote 1xBet", f"{row['odds']:.2f}")
+                if row.get("estimated") is not None:
+                    b.metric("Probabilité modèle", f"{row['estimated']:.1f}%")
+                    st.caption(
+                        f"Implicite {row['implied']:.1f}% • Écart {row['edge']:+.1f} pts "
+                        f"• Value {row['value']:+.1f}% • {row['filter_reason']}"
+                    )
+                else:
+                    b.metric("Analyse", "Non modélisée")
+                    st.caption(row.get("filter_reason", "Option détectée, mais non analysable."))
 
 if not rows and note:
-    st.warning("Aucune option ne correspond aux critères.")
+    st.warning("Aucune option n'a été trouvée dans la fourchette de cotes choisie. Essaie une fourchette plus large.")
 st.divider()
 st.caption("Le scanner récupère les options effectivement exposées par 1xBet. Le modèle n'invente pas de probabilité : il ne calcule que les marchés actuellement supportés (1X2, BTTS, total buts FT, score exact). Les autres restent détectables mais non analysés si tu les affiches.")
 st.caption("La probabilité modèle est indépendante des cotes 1xBet ; la cote sert ensuite uniquement à calculer probabilité implicite, écart et value théorique. Aucun résultat ne garantit un gain.")
