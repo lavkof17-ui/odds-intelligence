@@ -141,10 +141,29 @@ def cached_fixtures(start_iso, end_iso, bookmaker):
 
 @st.cache_data(ttl=120, show_spinner=False)
 def cached_tournament_odds(tournament_ids, bookmaker):
+    # OddsPapi accepte au maximum 5 tournamentIds par requête.
     return api_get("odds-by-tournaments", {
         "tournamentIds": tournament_ids, "bookmakers": bookmaker,
         "language": "en", "verbosity": 3
     })
+
+
+def fetch_odds_for_tournaments(tournament_ids, bookmaker):
+    """Récupère tous les tournois par lots de 5 et déduplique les matchs."""
+    all_events = {}
+    batches = [tournament_ids[i:i + 5] for i in range(0, len(tournament_ids), 5)]
+    for batch in batches:
+        data = cached_tournament_odds(",".join(batch), bookmaker)
+        if isinstance(data, list):
+            batch_events = data
+        elif isinstance(data, dict):
+            batch_events = list(data.values())
+        else:
+            batch_events = []
+        for event in batch_events:
+            if isinstance(event, dict) and event.get("fixtureId") is not None:
+                all_events.setdefault(str(event["fixtureId"]), event)
+    return list(all_events.values()), len(batches)
 
 
 def parse_fixture(board, catalog):
@@ -266,17 +285,36 @@ if scan:
         start_iso = start.strftime("%Y-%m-%dT%H:%M:%SZ")
         end_iso = (start + timedelta(hours=hours)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-        catalog = markets_catalog()
+        # 1) Les fixtures permettent de connaître les tournois réellement nécessaires.
         fixtures = cached_fixtures(start_iso, end_iso, BOOK)
         fixtures = fixtures if isinstance(fixtures, list) else []
-        tournament_ids = sorted({str(f.get("tournamentId")) for f in fixtures if isinstance(f, dict) and f.get("tournamentId") is not None})
+        tournament_ids = sorted({
+            str(f.get("tournamentId"))
+            for f in fixtures
+            if isinstance(f, dict) and f.get("tournamentId") is not None
+        })
 
         if not tournament_ids:
             st.session_state.rows = []
             st.session_state.note = "Aucun match avec cotes sur la fenêtre choisie."
         else:
-            odds_data = cached_tournament_odds(",".join(tournament_ids), BOOK)
-            events = odds_data if isinstance(odds_data, list) else list(odds_data.values()) if isinstance(odds_data, dict) else []
+            odds_batches_needed = (len(tournament_ids) + 4) // 5
+
+            # /account est non facturé. On contrôle le solde après la requête fixtures
+            # et avant de lancer les appels odds/catalogue restants.
+            get_account_status.clear()
+            quota_after_fixtures = read_quota()
+            minimum_needed = odds_batches_needed + 1  # lots odds + catalogue marchés
+            if quota_after_fixtures["remaining"] < minimum_needed:
+                raise RuntimeError(
+                    f"Scan interrompu pour protéger ton quota : {len(tournament_ids)} tournois "
+                    f"nécessitent {odds_batches_needed} appel(s) odds (5 tournois maximum par appel), "
+                    f"plus 1 appel catalogue éventuel. Il reste {quota_after_fixtures['remaining']} point(s). "
+                    "Aucun appel odds supplémentaire n'a été lancé."
+                )
+
+            catalog = markets_catalog()
+            events, actual_batches = fetch_odds_for_tournaments(tournament_ids, BOOK)
             wanted = {str(f.get("fixtureId")): f for f in fixtures if isinstance(f, dict)}
             model, rows, analyzable = None, [], 0
 
@@ -325,7 +363,10 @@ if scan:
 
             rows.sort(key=lambda r: (r.get("value") is not None, r.get("value") or -999, r.get("estimated") or -1), reverse=True)
             st.session_state.rows = rows
-            st.session_state.note = f"{len(wanted)} match(s) • {len(rows)} option(s) retenue(s) • {analyzable} analysée(s) indépendamment"
+            st.session_state.note = (
+                f"{len(wanted)} match(s) • {len(rows)} option(s) retenue(s) • "
+                f"{analyzable} analysée(s) indépendamment • {actual_batches} lot(s) de tournois"
+            )
 
         # Rafraîchit le compteur après le scan.
         get_account_status.clear()
@@ -361,4 +402,4 @@ if not rows and note:
 st.divider()
 st.caption("Le scanner récupère les options effectivement exposées par 1xBet. Le modèle n'invente pas de probabilité : il ne calcule que les marchés actuellement supportés (1X2, BTTS, total buts FT, score exact). Les autres restent détectables mais non analysés si tu les affiches.")
 st.caption("La probabilité modèle est indépendante des cotes 1xBet ; la cote sert ensuite uniquement à calculer probabilité implicite, écart et value théorique. Aucun résultat ne garantit un gain.")
-st.caption("Protection quota : /account est non facturé ; vérification avant chaque scan, cache de 2 minutes et blocage si moins de 3 points restent.")
+st.caption("Protection quota : /account est non facturé ; cache de 2 minutes ; les tournois sont envoyés par lots de 5 maximum ; contrôle du solde avant les appels de cotes.")
